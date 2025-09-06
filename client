@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>多设备网页控制端</title>
+    <style>
+        /* 多设备屏幕容器：网格布局 */
+        .device-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, 300px);
+            gap: 20px;
+            margin: 20px;
+        }
+        /* 设备屏幕卡片 */
+        .device-card {
+            border: 2px solid #ccc;
+            border-radius: 8px;
+            padding: 10px;
+        }
+        .device-card.online {
+            border-color: #2ecc71;
+        }
+        .device-title {
+            margin: 0 0 10px 0;
+            font-size: 16px;
+        }
+        /* 屏幕画布（固定比例16:9，适配多数设备） */
+        canvas {
+            width: 100%;
+            height: auto;
+            border: 1px solid #000;
+            cursor: pointer;
+        }
+        /* 群控按钮 */
+        .group-btn {
+            margin: 0 20px;
+            padding: 10px 20px;
+            font-size: 16px;
+            background: #3498db;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .group-btn:hover {
+            background: #2980b9;
+        }
+    </style>
+</head>
+<body>
+    <!-- 群控按钮 -->
+    <button class="group-btn" onclick="sendGroupCmd()">群控：点击所有设备(50%宽,50%高)</button>
+    <!-- 多设备屏幕容器 -->
+    <div class="device-container" id="deviceContainer"></div>
+
+    <script>
+        // WebSocket连接（替换为服务端IP，本地用localhost）
+        const ws = new WebSocket("ws://localhost:8765");
+        // 存储设备状态：key=device_id，value={canvas, ctx, width, height}
+        const deviceMap = {};
+
+        // 1. WebSocket连接成功：登录为网页控制端
+        ws.onopen = () => {
+            ws.send("web_controller");
+            console.log("已连接到WebSocket服务端");
+        };
+
+        // 2. 接收服务端消息
+        ws.onmessage = (event) => {
+            const msg = event.data;
+            // 设备上线通知
+            if (msg.startsWith("DEVICE_ONLINE:")) {
+                const devId = msg.replace("DEVICE_ONLINE:", "");
+                addDeviceCard(devId);
+            }
+            // 设备下线通知
+            else if (msg.startsWith("DEVICE_OFFLINE:")) {
+                const devId = msg.replace("DEVICE_OFFLINE:", "");
+                removeDeviceCard(devId);
+            }
+            // 屏幕流数据
+            else if (msg.startsWith("FRAME:")) {
+                const [devId, frameHex] = msg.replace("FRAME:", "").split("|");
+                renderFrame(devId, frameHex);
+            }
+            // 指令发送结果
+            else {
+                console.log("服务端反馈：", msg);
+            }
+        };
+
+        // 3. 添加设备屏幕卡片到页面
+        function addDeviceCard(devId) {
+            const container = document.getElementById("deviceContainer");
+            // 创建卡片元素
+            const card = document.createElement("div");
+            card.className = "device-card online";
+            card.id = `card_${devId}`;
+            
+            // 卡片标题
+            const title = document.createElement("h3");
+            title.className = "device-title";
+            title.textContent = devId.replace("device_", "设备：");
+            
+            // 画布（用于渲染屏幕流）
+            const canvas = document.createElement("canvas");
+            canvas.id = `canvas_${devId}`;
+            // 初始设置画布尺寸（设备实际分辨率后续更新）
+            canvas.width = 270;  // 卡片内画布宽度
+            canvas.height = 480; // 16:9比例（270*16/9=480）
+            
+            // 绑定点击事件（单控：点击画布下发指令）
+            canvas.onclick = (e) => {
+                sendSingleCmd(devId, e.offsetX, e.offsetY, canvas.width, canvas.height);
+            };
+
+            // 组装卡片
+            card.appendChild(title);
+            card.appendChild(canvas);
+            container.appendChild(card);
+
+            // 存储设备画布信息
+            deviceMap[devId] = {
+                canvas: canvas,
+                ctx: canvas.getContext("2d"),
+                width: 1080,  // 默认设备宽度（后续可从被控端获取真实值）
+                height: 2340  // 默认设备高度
+            };
+        }
+
+        // 4. 移除设备卡片
+        function removeDeviceCard(devId) {
+            const card = document.getElementById(`card_${devId}`);
+            if (card) card.remove();
+            delete deviceMap[devId];
+        }
+
+        // 5. 渲染屏幕流到画布
+        function renderFrame(devId, frameHex) {
+            const device = deviceMap[devId];
+            if (!device) return;
+
+            try {
+                // 16进制字符串→Uint8Array（RGB数据）
+                const frameBytes = new Uint8Array(
+                    frameHex.match(/.{2}/g).map(byte => parseInt(byte, 16))
+                );
+                // 创建ImageData（每个像素3字节RGB，无Alpha通道）
+                const imageData = device.ctx.createImageData(device.canvas.width, device.canvas.height);
+                const data = imageData.data;
+
+                // RGB→RGBA转换（ImageData需4通道，Alpha设为255）
+                for (let i = 0; i < frameBytes.length; i += 3) {
+                    const idx = (i / 3) * 4;
+                    data[idx] = frameBytes[i];     // R
+                    data[idx + 1] = frameBytes[i+1]; // G
+                    data[idx + 2] = frameBytes[i+2]; // B
+                    data[idx + 3] = 255;          // A（不透明）
+                }
+
+                // 绘制到画布
+                device.ctx.putImageData(imageData, 0, 0);
+            } catch (e) {
+                console.error(`渲染设备${devId}屏幕失败：`, e);
+            }
+        }
+
+        // 6. 发送单控指令（点击画布）
+        function sendSingleCmd(devId, clickX, clickY, canvasW, canvasH) {
+            const device = deviceMap[devId];
+            if (!device) return;
+
+            // 坐标映射：画布坐标 → 设备实际坐标
+            const devX = Math.round(clickX / canvasW * device.width);
+            const devY = Math.round(clickY / canvasH * device.height);
+
+            // minitouch点击指令（down→commit→up→commit）
+            const cmd = `down,0,${devX},${devY},100; commit; up,0; commit;`;
+            // 发送指令格式：TOUCH_SINGLE:device_id|指令
+            ws.send(`TOUCH_SINGLE:${devId}|${cmd}`);
+            console.log(`已发送单控指令到${devId}：(${devX},${devY})`);
+        }
+
+        // 7. 发送群控指令（点击所有设备的中心点）
+        function sendGroupCmd() {
+            // 群控指令：点击设备50%宽、50%高的位置
+            const cmd = "down,0,50%,50%,100; commit; up,0; commit;";
+            // 发送指令格式：TOUCH_GROUP:指令
+            ws.send(`TOUCH_GROUP:${cmd}`);
+            console.log("已发送群控指令到所有设备");
+        }
+
+        // 8. 连接关闭处理
+        ws.onclose = () => {
+            alert("与服务端连接已断开，请刷新页面重试");
+        };
+    </script>
+</body>
+</html>
