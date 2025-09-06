@@ -1,0 +1,96 @@
+import asyncio
+import websockets
+import subprocess
+import struct
+import re
+from typing import List, Tuple
+
+class AutoDeviceController:
+    def __init__(self, server_url: str = "ws://localhost:8765"):
+        self.server_url = server_url
+        self.device_tasks = []
+
+    # 枚举在线ADB设备
+    def list_adb_devices(self) -> List[str]:
+        try:
+            res = subprocess.run(["adb", "devices"], stdout=subprocess.PIPE, text=True)
+            lines = [l.strip() for l in res.stdout.splitlines() if l.strip()]
+            return [l.split("\t")[0] for l in lines[1:] if l.endswith("device")]
+        except Exception as e:
+            print(f"枚举设备失败：{e}")
+            return []
+
+    # 获取设备分辨率
+    def get_device_res(self, serial: str) -> Tuple[int, int]:
+        try:
+            res = subprocess.run(
+                ["adb", "-s", serial, "shell", "wm", "size"],
+                stdout=subprocess.PIPE, text=True
+            )
+            match = re.search(r"(\d+)x(\d+)", res.stdout)
+            return (int(match[1]), int(match[2])) if match else (1080, 2340)
+        except:
+            return (1080, 2340)
+
+    # 单个设备的被控逻辑
+    async def device_task(self, serial: str):
+        dev_id = f"device_{serial}"
+        width, height = self.get_device_res(serial)
+        # 启动minicap/minitouch
+        minicap = subprocess.Popen(
+            ["adb", "-s", serial, "shell", f"/data/local/tmp/minicap -P {width}x{height}@10fps -S"],
+            stdout=subprocess.PIPE
+        )
+        minitouch = subprocess.Popen(
+            ["adb", "-s", serial, "shell", "/data/local/tmp/minitouch -d"],
+            stdin=subprocess.PIPE
+        )
+
+        try:
+            async with websockets.connect(self.server_url) as ws:
+                # 登录：发送设备标识
+                await ws.send(dev_id)
+                print(f"设备{dev_id}（{width}x{height}）已连接服务端")
+
+                # 任务1：上传屏幕流
+                async def send_frame():
+                    while True:
+                        # 读取minicap帧（4字节长度头 + RGB数据）
+                        len_data = minicap.stdout.read(4)
+                        if not len_data:
+                            break
+                        frame_len = struct.unpack(">I", len_data)[0]
+                        frame_data = minicap.stdout.read(frame_len)
+                        # 转为16进制字符串发送
+                        await ws.send(frame_data.hex())
+                        await asyncio.sleep(0.1)
+
+                # 任务2：执行指令
+                async def exec_cmd():
+                    async for msg in ws:
+                        if msg.startswith("TOUCH:"):
+                            cmd = msg.replace("TOUCH:", "") + "\n"
+                            minitouch.stdin.write(cmd.encode())
+                            minitouch.stdin.flush()
+
+                await asyncio.gather(send_frame(), exec_cmd())
+        except Exception as e:
+            print(f"设备{dev_id}异常：{e}")
+        finally:
+            minicap.terminate()
+            minitouch.terminate()
+            print(f"设备{dev_id}已关闭")
+
+    # 启动所有设备
+    async def run(self):
+        devices = self.list_adb_devices()
+        if not devices:
+            print("未发现在线ADB设备")
+            return
+        # 为每个设备创建任务
+        self.device_tasks = [asyncio.create_task(self.device_task(s)) for s in devices]
+        await asyncio.gather(*self.device_tasks)
+
+if __name__ == "__main__":
+    controller = AutoDeviceController()
+    asyncio.run(controller.run())
