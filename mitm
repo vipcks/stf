@@ -1,0 +1,76 @@
+import asyncio
+import websockets
+from typing import Dict
+
+# 连接映射：key=标识（web_controller/device_序列号），value=WebSocket连接
+connections: Dict[str, websockets.WebSocketServerProtocol] = {}
+# 设备列表：存储所有在线被控端标识
+online_devices = []
+
+async def handle_client(websocket):
+    client_id = None
+    try:
+        # 1. 客户端登录：首次消息必须是标识（web_controller 或 device_序列号）
+        client_id = await websocket.recv()
+        if client_id in connections:
+            await websocket.send(f"ERROR: 标识{client_id}已在线")
+            await websocket.close()
+            return
+        
+        # 2. 绑定连接并通知
+        connections[client_id] = websocket
+        if client_id.startswith("device_"):
+            online_devices.append(client_id)
+            # 通知网页端：新设备上线
+            if "web_controller" in connections:
+                await connections["web_controller"].send(f"DEVICE_ONLINE:{client_id}")
+            print(f"设备{client_id}上线，当前在线：{online_devices}")
+        else:
+            print("网页控制端已连接")
+
+        # 3. 数据转发逻辑
+        async for msg in websocket:
+            # 网页端→被控端：指令转发（单控/群控）
+            if client_id == "web_controller":
+                # 指令格式：TOUCH_SINGLE:device_id|指令 或 TOUCH_GROUP:指令
+                if msg.startswith("TOUCH_SINGLE:"):
+                    dev_id, cmd = msg.split("|", 1)
+                    dev_id = dev_id.replace("TOUCH_SINGLE:", "")
+                    if dev_id in connections:
+                        await connections[dev_id].send(f"TOUCH:{cmd}")
+                        await websocket.send(f"SUCCESS: 单控指令已发至{dev_id}")
+                elif msg.startswith("TOUCH_GROUP:"):
+                    cmd = msg.replace("TOUCH_GROUP:", "")
+                    for dev_id in online_devices:
+                        await connections[dev_id].send(f"TOUCH:{cmd}")
+                    await websocket.send(f"SUCCESS: 群控指令已发至{len(online_devices)}台设备")
+            
+            # 被控端→网页端：屏幕流转发
+            elif client_id.startswith("device_"):
+                if "web_controller" in connections:
+                    # 屏幕流格式：FRAME:device_id|16进制帧数据
+                    await connections["web_controller"].send(f"FRAME:{client_id}|{msg}")
+
+    finally:
+        # 4. 客户端断开：清理连接
+        if client_id in connections:
+            del connections[client_id]
+            if client_id.startswith("device_") and client_id in online_devices:
+                online_devices.remove(client_id)
+                # 通知网页端：设备下线
+                if "web_controller" in connections:
+                    await connections["web_controller"].send(f"DEVICE_OFFLINE:{client_id}")
+            print(f"{client_id}已断开，当前在线设备：{online_devices}")
+
+# 启动服务（监听8765端口，允许跨域）
+async def main():
+    async with websockets.serve(
+        handle_client, 
+        "0.0.0.0", 8765,
+        cors_allowed_origins="*"  # 允许网页跨域连接
+    ):
+        print("WebSocket服务端已启动，监听8765端口")
+        await asyncio.Future()
+
+if __name__ == "__main__":
+    asyncio.run(main())
